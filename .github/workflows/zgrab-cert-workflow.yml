@@ -46,21 +46,25 @@ jobs:
       - name: Find next available ranges
         id: range_finder
         run: |
-          # Create arrays to store processed and running ranges
-          processed_ranges=()
-          running_ranges=()
-          valid_ranges=()
-          ranges_to_process=()
-
+          # Use files instead of arrays to track ranges
+          PROCESSED_RANGES_FILE="processed_ranges.txt"
+          RUNNING_RANGES_FILE="running_ranges.txt"
+          RANGES_TO_PROCESS_FILE="ranges_to_process.txt"
+          
+          # Create empty files
+          > "$PROCESSED_RANGES_FILE"
+          > "$RUNNING_RANGES_FILE"
+          > "$RANGES_TO_PROCESS_FILE"
+          
           # Create empty ranges file
           echo "[]" > ranges_to_scan.json
           
           # Get list of scanned certificate ranges
           echo "Checking for already processed ranges..."
           find cert_results -type f -name "summary.json" | while read -r summary_file; do
-            range=$(jq -r '.range' "$summary_file")
+            range=$(jq -r '.range' "$summary_file" 2>/dev/null)
             if [ -n "$range" ]; then
-              processed_ranges+=("$range")
+              echo "$range" >> "$PROCESSED_RANGES_FILE"
               echo "Already processed: $range"
             fi
           done
@@ -69,20 +73,17 @@ jobs:
           echo "Checking for currently running scans..."
           for f in .github/running_cert_scans/*; do
             if [ -f "$f" ] && [ "$(basename "$f")" != "workflow_${{ github.run_id }}.txt" ]; then
-              while IFS= read -r line; do
-                if [ -n "$line" ]; then
-                  running_ranges+=("$line")
-                  echo "Currently running: $line"
-                fi
-              done < "$f"
+              cat "$f" >> "$RUNNING_RANGES_FILE"
             fi
           done
           
           # Create running scans file for this workflow
-          echo "" > ".github/running_cert_scans/workflow_${{ github.run_id }}.txt"
+          > ".github/running_cert_scans/workflow_${{ github.run_id }}.txt"
           
           # Find ZMap results that have valid IPs
           echo "Looking for ZMap results with active IPs..."
+          > zmap_ranges_with_ips.txt
+          
           find zmap_results -name "*.json" | while read -r zmap_file; do
             # Skip summary.json
             if [[ $(basename "$zmap_file") == "summary.json" ]]; then
@@ -97,41 +98,56 @@ jobs:
             if [ -f "$zmap_file" ]; then
               total_ips=$(jq '.total_ips' "$zmap_file" 2>/dev/null || echo "0")
               if [ "$total_ips" -gt 0 ]; then
-                valid_ranges+=("$cidr")
-                
-                # Check if already processed or running
-                if printf '%s\n' "${processed_ranges[@]}" | grep -q -P "^${cidr}$"; then
-                  echo "Skipping $cidr (already processed)"
-                elif printf '%s\n' "${running_ranges[@]}" | grep -q -P "^${cidr}$"; then
-                  echo "Skipping $cidr (currently running in another workflow)"
-                else
-                  ranges_to_process+=("$cidr")
-                  echo "Found range to process: $cidr (${total_ips} IPs)"
-                fi
+                echo "$cidr|$total_ips" >> zmap_ranges_with_ips.txt
               fi
             fi
           done
           
+          # Count total ranges with IPs for reporting
+          total_ranges_with_ips=$(wc -l < zmap_ranges_with_ips.txt)
+          echo "Found $total_ranges_with_ips ranges with active IPs"
+          
+          # Calculate which ranges to process
+          while IFS='|' read -r cidr total_ips; do
+            # Skip if already processed
+            if grep -q "^$cidr$" "$PROCESSED_RANGES_FILE"; then
+              echo "Skipping $cidr (already processed)"
+              continue
+            fi
+            
+            # Skip if currently running in another workflow
+            if grep -q "^$cidr$" "$RUNNING_RANGES_FILE"; then
+              echo "Skipping $cidr (currently running in another workflow)"
+              continue
+            fi
+            
+            # Add to our list to process
+            echo "$cidr" >> "$RANGES_TO_PROCESS_FILE"
+            echo "Found range to process: $cidr ($total_ips IPs)"
+          done < zmap_ranges_with_ips.txt
+          
+          # Calculate how many ranges we've found
+          total_available=$(wc -l < "$RANGES_TO_PROCESS_FILE")
+          echo "Found $total_available ranges available to process"
+          
           # Select ranges for this batch
           ranges_found=0
-          for cidr in "${ranges_to_process[@]}"; do
-            if [ $ranges_found -lt ${{ inputs.batch_size }} ]; then
-              echo "$cidr" >> ".github/running_cert_scans/workflow_${{ github.run_id }}.txt"
-              jq --arg cidr "$cidr" '. += [$cidr]' ranges_to_scan.json > ranges_to_scan.json.tmp
-              mv ranges_to_scan.json.tmp ranges_to_scan.json
-              ranges_found=$((ranges_found + 1))
-              echo "Added $cidr to batch. ($ranges_found of ${{ inputs.batch_size }})"
-            else
-              break
-            fi
-          done
+          while IFS= read -r cidr && [ $ranges_found -lt ${{ inputs.batch_size }} ]; do
+            echo "$cidr" >> ".github/running_cert_scans/workflow_${{ github.run_id }}.txt"
+            jq --arg cidr "$cidr" '. += [$cidr]' ranges_to_scan.json > ranges_to_scan.json.tmp
+            mv ranges_to_scan.json.tmp ranges_to_scan.json
+            ranges_found=$((ranges_found + 1))
+            echo "Added $cidr to batch. ($ranges_found of ${{ inputs.batch_size }})"
+          done < "$RANGES_TO_PROCESS_FILE"
           
           # Print summary
           echo "====== SUMMARY ======="
-          echo "Found ${#valid_ranges[@]} total ranges with active IPs"
-          echo "Already processed: ${#processed_ranges[@]} ranges"
-          echo "Currently running: ${#running_ranges[@]} ranges"
-          echo "Available to process: ${#ranges_to_process[@]} ranges"
+          processed_count=$(wc -l < "$PROCESSED_RANGES_FILE" || echo 0)
+          running_count=$(wc -l < "$RUNNING_RANGES_FILE" || echo 0)
+          echo "Found $total_ranges_with_ips total ranges with active IPs"
+          echo "Already processed: $processed_count ranges"
+          echo "Currently running: $running_count ranges"
+          echo "Available to process: $total_available ranges"
           echo "Selected for this batch: $ranges_found ranges"
           
           # Set output
@@ -139,6 +155,7 @@ jobs:
           echo "ranges_found=$ranges_found" >> $GITHUB_OUTPUT
           
           # Commit running scans file
+          cat ranges_to_scan.json
           git add ".github/running_cert_scans/workflow_${{ github.run_id }}.txt"
           if git commit -m "Add running cert scans for workflow ${{ github.run_id }}"; then
             git push origin main || echo "Failed to push initial running cert scans file"
@@ -191,7 +208,7 @@ jobs:
               git checkout main
               git branch -D "$branch_name"
               
-              if [ $attempt -lt $max_attempts ]; then
+              if [ $attempt -lt $max_attempts ]; do
                 echo "Waiting ${delay} seconds before next attempt..."
                 sleep $delay
                 delay=$((delay * 2))  # Exponential backoff
@@ -344,12 +361,10 @@ jobs:
 
           # Read ranges to scan
           echo "Reading ranges from ranges_to_scan.json"
-          readarray -t ranges < <(jq -r '.[]' ranges_to_scan.json)
-          total_ranges=${#ranges[@]}
-          echo "Found $total_ranges ranges to process"
+          cat ranges_to_scan.json
           
-          # Process ranges one at a time to avoid git conflicts
-          for cidr in "${ranges[@]}"; do
+          # Process ranges one at a time
+          jq -r '.[]' ranges_to_scan.json | while read -r cidr; do
             echo "Processing range: $cidr"
             safe_name=$(echo "$cidr" | tr '/' '_')
             results_dir="cert_results/${safe_name}"
@@ -482,35 +497,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Count total ranges with ZMap results that have IPs
-          total_ranges_with_ips=0
-          processed_ranges=0
+          # Check if there are more ranges to process
+          processed_count=$(find cert_results -type f -name "summary.json" | wc -l)
+          total_ranges_with_ips=$(grep -v "total_ips.*:.*0" zmap_results/*.json | grep -v summary.json | wc -l)
           
-          # Count ranges with IPs
-          find zmap_results -name "*.json" | while read -r zmap_file; do
-            if [[ $(basename "$zmap_file") != "summary.json" ]]; then
-              if [ -f "$zmap_file" ]; then
-                total_ips=$(jq '.total_ips' "$zmap_file" 2>/dev/null || echo "0")
-                if [ "$total_ips" -gt 0 ]; then
-                  total_ranges_with_ips=$((total_ranges_with_ips + 1))
-                fi
-              fi
-            fi
-          done
-          
-          # Count processed ranges
-          find cert_results -type f -name "summary.json" | while read -r summary_file; do
-            processed_ranges=$((processed_ranges + 1))
-          done
+          echo "Total ranges with IPs: $total_ranges_with_ips"
+          echo "Processed ranges: $processed_count"
           
           # If there are more ranges to process, trigger next batch
-          remaining=$((total_ranges_with_ips - processed_ranges))
-          echo "Total ranges with IPs: $total_ranges_with_ips"
-          echo "Processed ranges: $processed_ranges"
-          echo "Remaining ranges: $remaining"
-          
-          if [ $remaining -gt 0 ]; then
-            echo "There are still $remaining ranges to process. Triggering next batch..."
+          if [ $processed_count -lt $total_ranges_with_ips ]; then
+            echo "There are still $((total_ranges_with_ips - processed_count)) ranges to process. Triggering next batch..."
             
             # Get current workflow filename
             WORKFLOW_PATH=".github/workflows/zgrab-cert-workflow.yml"
