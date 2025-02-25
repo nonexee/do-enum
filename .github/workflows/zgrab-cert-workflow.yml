@@ -3,8 +3,12 @@ name: ZGrab2 Certificate Collection
 on:
   workflow_dispatch:
     inputs:
+      start_line:
+        description: 'Start processing from line number (1-based)'
+        required: true
+        type: number
       batch_size:
-        description: 'Number of ranges to process in this run'
+        description: 'Number of ranges to process'
         required: true
         type: number
         default: 3
@@ -12,9 +16,6 @@ on:
 jobs:
   collect-certs:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      actions: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
@@ -24,18 +25,14 @@ jobs:
 
       - name: Configure Git
         run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git config --local gc.auto 0
-          git config --local core.autocrlf false
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
           git fetch origin
-          git checkout main
-          git pull origin main
+          git reset --hard origin/main
 
       - name: Setup workspace
         run: |
           mkdir -p cert_results
-          mkdir -p .github/running_cert_scans
           chmod -R 777 "${{ github.workspace }}"
 
       - name: Install dependencies
@@ -43,189 +40,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq gzip
 
-      - name: Find next available ranges
-        id: range_finder
-        run: |
-          # Use files instead of arrays to track ranges
-          PROCESSED_RANGES_FILE="processed_ranges.txt"
-          RUNNING_RANGES_FILE="running_ranges.txt"
-          RANGES_TO_PROCESS_FILE="ranges_to_process.txt"
-          
-          # Create empty files
-          > "$PROCESSED_RANGES_FILE"
-          > "$RUNNING_RANGES_FILE"
-          > "$RANGES_TO_PROCESS_FILE"
-          
-          # Create empty ranges file
-          echo "[]" > ranges_to_scan.json
-          
-          # Get list of scanned certificate ranges
-          echo "Checking for already processed ranges..."
-          find cert_results -type f -name "summary.json" | while read -r summary_file; do
-            range=$(jq -r '.range' "$summary_file" 2>/dev/null)
-            if [ -n "$range" ]; then
-              echo "$range" >> "$PROCESSED_RANGES_FILE"
-              echo "Already processed: $range"
-            fi
-          done
-          
-          # Get list of currently running scans
-          echo "Checking for currently running scans..."
-          for f in .github/running_cert_scans/*; do
-            if [ -f "$f" ] && [ "$(basename "$f")" != "workflow_${{ github.run_id }}.txt" ]; then
-              cat "$f" >> "$RUNNING_RANGES_FILE"
-            fi
-          done
-          
-          # Create running scans file for this workflow
-          > ".github/running_cert_scans/workflow_${{ github.run_id }}.txt"
-          
-          # Find ZMap results that have valid IPs
-          echo "Looking for ZMap results with active IPs..."
-          > zmap_ranges_with_ips.txt
-          
-          find zmap_results -name "*.json" | while read -r zmap_file; do
-            # Skip summary.json
-            if [[ $(basename "$zmap_file") == "summary.json" ]]; then
-              continue
-            fi
-            
-            # Extract range from filename
-            filename=$(basename "$zmap_file" .json)
-            cidr=$(echo "$filename" | tr '_' '/')
-            
-            # Check if it has active IPs
-            if [ -f "$zmap_file" ]; then
-              total_ips=$(jq '.total_ips' "$zmap_file" 2>/dev/null || echo "0")
-              if [ "$total_ips" -gt 0 ]; then
-                echo "$cidr|$total_ips" >> zmap_ranges_with_ips.txt
-              fi
-            fi
-          done
-          
-          # Count total ranges with IPs for reporting
-          total_ranges_with_ips=$(wc -l < zmap_ranges_with_ips.txt)
-          echo "Found $total_ranges_with_ips ranges with active IPs"
-          
-          # Calculate which ranges to process
-          while IFS='|' read -r cidr total_ips; do
-            # Skip if already processed
-            if grep -q "^$cidr$" "$PROCESSED_RANGES_FILE"; then
-              echo "Skipping $cidr (already processed)"
-              continue
-            fi
-            
-            # Skip if currently running in another workflow
-            if grep -q "^$cidr$" "$RUNNING_RANGES_FILE"; then
-              echo "Skipping $cidr (currently running in another workflow)"
-              continue
-            fi
-            
-            # Add to our list to process
-            echo "$cidr" >> "$RANGES_TO_PROCESS_FILE"
-            echo "Found range to process: $cidr ($total_ips IPs)"
-          done < zmap_ranges_with_ips.txt
-          
-          # Calculate how many ranges we've found
-          total_available=$(wc -l < "$RANGES_TO_PROCESS_FILE")
-          echo "Found $total_available ranges available to process"
-          
-          # Select ranges for this batch
-          ranges_found=0
-          while IFS= read -r cidr && [ $ranges_found -lt ${{ inputs.batch_size }} ]; do
-            echo "$cidr" >> ".github/running_cert_scans/workflow_${{ github.run_id }}.txt"
-            jq --arg cidr "$cidr" '. += [$cidr]' ranges_to_scan.json > ranges_to_scan.json.tmp
-            mv ranges_to_scan.json.tmp ranges_to_scan.json
-            ranges_found=$((ranges_found + 1))
-            echo "Added $cidr to batch. ($ranges_found of ${{ inputs.batch_size }})"
-          done < "$RANGES_TO_PROCESS_FILE"
-          
-          # Print summary
-          echo "====== SUMMARY ======="
-          processed_count=$(wc -l < "$PROCESSED_RANGES_FILE" || echo 0)
-          running_count=$(wc -l < "$RUNNING_RANGES_FILE" || echo 0)
-          echo "Found $total_ranges_with_ips total ranges with active IPs"
-          echo "Already processed: $processed_count ranges"
-          echo "Currently running: $running_count ranges"
-          echo "Available to process: $total_available ranges"
-          echo "Selected for this batch: $ranges_found ranges"
-          
-          # Set output
-          echo "ranges_file=ranges_to_scan.json" >> $GITHUB_OUTPUT
-          echo "ranges_found=$ranges_found" >> $GITHUB_OUTPUT
-          
-          # Commit running scans file
-          cat ranges_to_scan.json
-          git add ".github/running_cert_scans/workflow_${{ github.run_id }}.txt"
-          if git commit -m "Add running cert scans for workflow ${{ github.run_id }}"; then
-            git push origin main || echo "Failed to push initial running cert scans file"
-          fi
-
       - name: Process ranges with ZGrab2
-        if: steps.range_finder.outputs.ranges_found > 0
         run: |
-          # Helper function for git operations
-          push_changes() {
-            local description="$1"
-            local directory="$2"
-            local max_attempts=5
-            local attempt=1
-            local delay=10
-            
-            while [ $attempt -le $max_attempts ]; do
-              echo "Attempt $attempt to push changes for $description"
-              
-              # Fetch latest changes
-              git fetch origin main
-              
-              # Create new branch with timestamp to avoid conflicts
-              local branch_name="cert-scan-$(date +%s)-${RANDOM}"
-              git checkout -b "$branch_name" origin/main
-              
-              # Stage all changes in cert directory
-              git add "$directory/"
-              
-              # Check if there are changes to commit
-              if git diff --staged --quiet; then
-                echo "No changes to commit"
-                git checkout main
-                git branch -D "$branch_name"
-                return 0
-              fi
-              
-              # Try to commit and push
-              if git commit -m "Add certificate scan results for $description"; then
-                if git push origin "$branch_name":main; then
-                  echo "Successfully pushed changes for $description"
-                  git checkout main
-                  git branch -D "$branch_name"
-                  return 0
-                fi
-              fi
-              
-              # If we get here, push failed
-              echo "Push attempt $attempt failed, cleaning up"
-              git checkout main
-              git branch -D "$branch_name"
-              
-              if [ $attempt -lt $max_attempts ]; do
-                echo "Waiting ${delay} seconds before next attempt..."
-                sleep $delay
-                delay=$((delay * 2))  # Exponential backoff
-              fi
-              
-              attempt=$((attempt + 1))
-            done
-            
-            echo "Failed to push changes after $max_attempts attempts"
-            return 1
-          }
-          
-          # Split and compress results function
           split_and_compress_results() {
             local input_file="$1"
             local results_dir="$2"
-            local chunk_size=$((90 * 1024 * 1024))  # 90MB in bytes
+            local chunk_size=$((90 * 1024 * 1024))  # 2MB in bytes
             
             # Get total certificates and metadata
             local total_count=$(jq '.total_count' "$input_file")
@@ -236,7 +56,7 @@ jobs:
             echo "Processing file of size ${size_mb}MB..."
             
             if [ $size_mb -gt 90 ]; then
-                echo "Splitting into chunks..."
+                echo "Splitting into 2MB chunks..."
                 
                 # Calculate certificates per chunk based on file size ratio
                 local certs_per_chunk=$((total_count * chunk_size / file_size))
@@ -290,7 +110,6 @@ jobs:
             fi
           }
 
-          # Process ZGrab output function
           process_zgrab_output() {
             local input_file="$1"
             local results_dir="$2"
@@ -354,17 +173,17 @@ jobs:
                 scan_time: "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
               }' "$input_file" > "$temp_json"
 
-            # Compress results
+            # Split and compress results
             split_and_compress_results "$temp_json" "$results_dir"
             rm -f "$temp_json"
           }
 
-          # Read ranges to scan
-          echo "Reading ranges from ranges_to_scan.json"
-          cat ranges_to_scan.json
+          START_LINE=${{ inputs.start_line }}
+          END_LINE=$((START_LINE + ${{ inputs.batch_size }} - 1))
           
-          # Process ranges one at a time
-          jq -r '.[]' ranges_to_scan.json | while read -r cidr; do
+          while IFS= read -r cidr; do
+            [ -z "$cidr" ] && continue
+            
             echo "Processing range: $cidr"
             safe_name=$(echo "$cidr" | tr '/' '_')
             results_dir="cert_results/${safe_name}"
@@ -381,12 +200,9 @@ jobs:
             jq -r '.ips[]?' "$zmap_result" > "tmp_ips.txt" 2>/dev/null
             
             if [ -s tmp_ips.txt ]; then
-              ip_count=$(wc -l < tmp_ips.txt)
-              echo "Found $ip_count IPs to scan for $cidr"
-              
               echo "Running ZGrab2 for ${safe_name}..."
               
-              if timeout 180m docker run --rm --network=host -v "${{ github.workspace }}":/data \
+              if docker run --rm --network=host -v "${{ github.workspace }}":/data \
                 sec32/zgrab2 zgrab2 tls --port 443 \
                 --timeout 10s \
                 --input-file=/data/tmp_ips.txt \
@@ -419,8 +235,18 @@ jobs:
                     echo "Processed $total_certs certificates for $cidr"
                   fi
                   
-                  # Push results for this range
-                  push_changes "$cidr" "$results_dir" || echo "Failed to push changes for $cidr"
+                  # Commit and push results
+                  git add "${results_dir}/"
+                  if git commit -m "Add certificate scan results for $cidr"; then
+                    for i in {1..3}; do
+                      if git push origin main; then
+                        break
+                      else
+                        echo "Push failed, attempt $i of 3. Pulling latest changes..."
+                        git pull --rebase origin main
+                      fi
+                    done
+                  fi
                 else
                   echo "Failed to create output file for $cidr"
                 fi
@@ -433,107 +259,4 @@ jobs:
             
             # Cleanup temporary files
             rm -f tmp_ips.txt tmp_certs.json
-          done
-
-      - name: Cleanup running scans file
-        if: always()
-        run: |
-          echo "Starting cleanup of running cert scans file..."
-          
-          # Reset git state first
-          git fetch origin main
-          git checkout main -f
-          git reset --hard origin/main
-          git clean -fd
-          
-          # Setup git identity
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-
-          # Define running scans file path
-          RUNNING_SCANS_FILE=".github/running_cert_scans/workflow_${{ github.run_id }}.txt"
-          
-          echo "Checking for running scans file: $RUNNING_SCANS_FILE"
-          
-          # Check if file exists
-          if [ -f "$RUNNING_SCANS_FILE" ]; then
-            echo "Found running scans file. Removing it..."
-            
-            # Remove the file
-            rm -f "$RUNNING_SCANS_FILE"
-            
-            # Stage the deletion
-            git add --all .github/running_cert_scans/
-            
-            # Commit the deletion
-            if git commit -m "Remove running cert scans file for workflow ${{ github.run_id }}"; then
-              echo "Changes committed. Pushing to repository..."
-              
-              # Push with retry logic
-              max_retries=3
-              for retry in $(seq 1 $max_retries); do
-                if git push origin main; then
-                  echo "Successfully removed running cert scans file"
-                  break
-                else
-                  if [ $retry -eq $max_retries ]; then
-                    echo "Failed to push changes after $max_retries attempts"
-                  else
-                    echo "Push failed, retrying ($retry/$max_retries)..."
-                    git pull --rebase origin main
-                    sleep 3
-                  fi
-                fi
-              done
-            else
-              echo "No changes to commit or commit failed"
-            fi
-          else
-            echo "Running cert scans file not found for this workflow"
-          fi
-
-      - name: Trigger next batch if more ranges available
-        if: steps.range_finder.outputs.ranges_found > 0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Check if there are more ranges to process
-          processed_count=$(find cert_results -type f -name "summary.json" | wc -l)
-          total_ranges_with_ips=$(grep -v "total_ips.*:.*0" zmap_results/*.json | grep -v summary.json | wc -l)
-          
-          echo "Total ranges with IPs: $total_ranges_with_ips"
-          echo "Processed ranges: $processed_count"
-          
-          # If there are more ranges to process, trigger next batch
-          if [ $processed_count -lt $total_ranges_with_ips ]; then
-            echo "There are still $((total_ranges_with_ips - processed_count)) ranges to process. Triggering next batch..."
-            
-            # Get current workflow filename
-            WORKFLOW_PATH=".github/workflows/zgrab-cert-workflow.yml"
-            
-            # Check if workflow file exists
-            if [ ! -f "$WORKFLOW_PATH" ]; then
-              # Try to find the workflow file
-              WORKFLOW_PATH=$(find .github/workflows -name "*.yml" -type f -exec grep -l "ZGrab2 Certificate Collection" {} \; | head -n 1)
-              
-              if [ -z "$WORKFLOW_PATH" ]; then
-                echo "Could not find workflow file. Please check the workflow name."
-                exit 1
-              fi
-            fi
-            
-            echo "Found workflow file: $WORKFLOW_PATH"
-            WORKFLOW_NAME=$(basename "$WORKFLOW_PATH")
-            
-            # Trigger next workflow run
-            echo "Triggering next batch with workflow: $WORKFLOW_NAME"
-            curl -L \
-              -X POST \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$WORKFLOW_NAME/dispatches" \
-              -d "{\"ref\":\"main\",\"inputs\":{\"batch_size\":\"${{ inputs.batch_size }}\"}}"
-          else
-            echo "All ranges have been processed. No need to trigger next batch."
-          fi
+          done < <(awk -v start="$START_LINE" -v end="$END_LINE" 'NR >= start && NR <= end' do_ranges.txt)
