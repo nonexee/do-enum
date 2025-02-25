@@ -1,0 +1,493 @@
+name: ZGrab2 Certificate Collection
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_size:
+        description: 'Number of ranges to process in this run'
+        required: true
+        type: number
+        default: 3
+
+jobs:
+  collect-certs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git config --local gc.auto 0
+          git config --local core.autocrlf false
+          git fetch origin
+          git checkout main
+          git pull origin main
+
+      - name: Setup workspace
+        run: |
+          mkdir -p cert_results
+          mkdir -p .github/running_cert_scans
+          chmod -R 777 "${{ github.workspace }}"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq gzip
+
+      - name: Find next available ranges
+        id: range_finder
+        run: |
+          # Create empty ranges file
+          echo "[]" > ranges_to_scan.json
+          
+          # Get list of scanned certificate ranges
+          processed_ranges=()
+          find cert_results -type f -name "summary.json" | while read -r summary_file; do
+            range=$(jq -r '.range' "$summary_file")
+            if [ -n "$range" ]; then
+              processed_ranges+=("$range")
+            fi
+          done
+          
+          # Get list of currently running scans
+          running_ranges=()
+          for f in .github/running_cert_scans/*; do
+            if [ -f "$f" ]; then
+              readarray -t current_running < <(cat "$f")
+              running_ranges+=("${current_running[@]}")
+            fi
+          done
+          
+          # Create running scans file for this workflow
+          echo "" > ".github/running_cert_scans/workflow_${{ github.run_id }}.txt"
+          
+          # Counter for ranges found
+          ranges_found=0
+          
+          # First, find ZMap results that have valid IPs
+          echo "Looking for ZMap results with active IPs..."
+          valid_ranges=()
+          
+          find zmap_results -name "*.json" | while read -r zmap_file; do
+            # Skip summary.json
+            if [[ $(basename "$zmap_file") == "summary.json" ]]; then
+              continue
+            fi
+            
+            # Extract range from filename
+            filename=$(basename "$zmap_file" .json)
+            cidr=$(echo "$filename" | tr '_' '/')
+            
+            # Check if it has active IPs
+            total_ips=$(jq '.total_ips' "$zmap_file")
+            if [ "$total_ips" -gt 0 ]; then
+              valid_ranges+=("$cidr")
+              echo "Found range with active IPs: $cidr (${total_ips} IPs)"
+            fi
+          done
+          
+          echo "Found ${#valid_ranges[@]} ranges with active IPs"
+          
+          # Process each range from the ones with active IPs
+          for cidr in "${valid_ranges[@]}"; do
+            # Skip if already processed
+            if [[ " ${processed_ranges[@]} " =~ " ${cidr} " ]]; then
+              echo "Range $cidr already processed, skipping..."
+              continue
+            fi
+            
+            # Skip if currently being processed
+            if [[ " ${running_ranges[@]} " =~ " ${cidr} " ]]; then
+              echo "Range $cidr is currently being processed, skipping..."
+              continue
+            fi
+            
+            # Add to our batch if we haven't reached the limit
+            if [ $ranges_found -lt ${{ inputs.batch_size }} ]; then
+              echo "$cidr" >> ".github/running_cert_scans/workflow_${{ github.run_id }}.txt"
+              jq --arg cidr "$cidr" '. += [$cidr]' ranges_to_scan.json > ranges_to_scan.json.tmp
+              mv ranges_to_scan.json.tmp ranges_to_scan.json
+              ranges_found=$((ranges_found + 1))
+              echo "Added $cidr to batch. ($ranges_found of ${{ inputs.batch_size }})"
+            else
+              break
+            fi
+          done
+          
+          # Set output
+          echo "ranges_file=ranges_to_scan.json" >> $GITHUB_OUTPUT
+          echo "ranges_found=$ranges_found" >> $GITHUB_OUTPUT
+          
+          # Commit running scans file
+          git add ".github/running_cert_scans/workflow_${{ github.run_id }}.txt"
+          if git commit -m "Add running cert scans for workflow ${{ github.run_id }}"; then
+            git push origin main || echo "Failed to push initial running cert scans file"
+          fi
+
+      - name: Process ranges with ZGrab2
+        if: steps.range_finder.outputs.ranges_found > 0
+        run: |
+          # Helper function for git operations
+          push_changes() {
+            local description="$1"
+            local directory="$2"
+            local max_attempts=5
+            local attempt=1
+            local delay=10
+            
+            while [ $attempt -le $max_attempts ]; do
+              echo "Attempt $attempt to push changes for $description"
+              
+              # Fetch latest changes
+              git fetch origin main
+              
+              # Create new branch with timestamp to avoid conflicts
+              local branch_name="cert-scan-$(date +%s)-${RANDOM}"
+              git checkout -b "$branch_name" origin/main
+              
+              # Stage all changes in cert directory
+              git add "$directory/"
+              
+              # Check if there are changes to commit
+              if git diff --staged --quiet; then
+                echo "No changes to commit"
+                git checkout main
+                git branch -D "$branch_name"
+                return 0
+              fi
+              
+              # Try to commit and push
+              if git commit -m "Add certificate scan results for $description"; then
+                if git push origin "$branch_name":main; then
+                  echo "Successfully pushed changes for $description"
+                  git checkout main
+                  git branch -D "$branch_name"
+                  return 0
+                fi
+              fi
+              
+              # If we get here, push failed
+              echo "Push attempt $attempt failed, cleaning up"
+              git checkout main
+              git branch -D "$branch_name"
+              
+              if [ $attempt -lt $max_attempts ]; then
+                echo "Waiting ${delay} seconds before next attempt..."
+                sleep $delay
+                delay=$((delay * 2))  # Exponential backoff
+              fi
+              
+              attempt=$((attempt + 1))
+            done
+            
+            echo "Failed to push changes after $max_attempts attempts"
+            return 1
+          }
+
+          # Process ZGrab output function
+          process_zgrab_output() {
+            local input_file="$1"
+            local results_dir="$2"
+            
+            if [ ! -s "$input_file" ]; then
+              echo "Empty or missing input file: $input_file"
+              echo '{
+                "certificates": [],
+                "total_count": 0,
+                "scan_time": "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
+              }' > "${results_dir}/certs.json"
+              return
+            fi
+            
+            echo "Processing certificates..."
+            local temp_json="${results_dir}/temp_certs.json"
+            
+            # Process and create initial JSON
+            jq -c '[inputs | select(.data != null and .data.tls != null) |
+              select(.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] != null) |
+              select(.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] != "") | {
+                ip: .ip,
+                tls: {
+                  protocol_version: (.data.tls.result.handshake_log.server_hello.version.name // null),
+                  cipher_suite: {
+                    name: (.data.tls.result.handshake_log.server_hello.cipher_suite.name // null),
+                    value: (.data.tls.result.handshake_log.server_hello.cipher_suite.value // null)
+                  },
+                  certificate_details: {
+                    validity: {
+                      start: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.validity.start // null),
+                      end: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.validity.end // null)
+                    },
+                    issuer: {
+                      common_name: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.common_name[0] // null),
+                      organization: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.organization[0] // null),
+                      country: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.country[0] // null)
+                    },
+                    subject: {
+                      common_name: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] // null)
+                    },
+                    public_key: {
+                      algorithm: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject_key_info.key_algorithm.name // null),
+                      length: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject_key_info.rsa_public_key.length // null)
+                    }
+                  },
+                  security_audit: {
+                    certificate_chain: [
+                      .data.tls.result.handshake_log.server_certificates.chain[]? | 
+                      select(. != null) | {
+                        issuer_common_name: (.parsed.issuer.common_name[0] // null),
+                        valid: (.parsed.signature.valid // false)
+                      }
+                    ],
+                    browser_trusted: (.data.tls.result.handshake_log.server_certificates.validation.browser_trusted // false)
+                  }
+                }
+              }] | {
+                certificates: .,
+                total_count: length,
+                scan_time: "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
+              }' "$input_file" > "$temp_json"
+
+            # Compress results
+            split_and_compress_results "$temp_json" "$results_dir"
+            rm -f "$temp_json"
+          }
+          
+          # Split and compress results function
+          split_and_compress_results() {
+            local input_file="$1"
+            local results_dir="$2"
+            local chunk_size=$((90 * 1024 * 1024))  # 90MB in bytes
+            
+            # Get total certificates and metadata
+            local total_count=$(jq '.total_count' "$input_file")
+            local scan_time=$(jq -r '.scan_time' "$input_file")
+            local file_size=$(stat -f%z "$input_file" 2>/dev/null || stat -c%s "$input_file")
+            local size_mb=$((file_size / 1024 / 1024))
+            
+            echo "Processing file of size ${size_mb}MB..."
+            
+            if [ $size_mb -gt 90 ]; then
+                echo "Splitting into chunks..."
+                
+                # Calculate certificates per chunk based on file size ratio
+                local certs_per_chunk=$((total_count * chunk_size / file_size))
+                local chunk_number=0
+                
+                # Create metadata file
+                jq '{
+                    total_count: .total_count,
+                    scan_time: .scan_time,
+                    split: true,
+                    original_size_mb: '$size_mb',
+                    chunks: []
+                }' "$input_file" > "${results_dir}/certs.json"
+                
+                # Split and process chunks
+                jq -c '.certificates | _nwise('$certs_per_chunk')' "$input_file" | while read -r chunk; do
+                    chunk_number=$((chunk_number + 1))
+                    local chunk_file="${results_dir}/certs_part_${chunk_number}.json"
+                    local chunk_gz="${results_dir}/certs_part_${chunk_number}.json.gz"
+                    
+                    # Create chunk JSON
+                    echo "{
+                        \"certificates\": ${chunk},
+                        \"part\": ${chunk_number},
+                        \"scan_time\": \"${scan_time}\"
+                    }" | jq '.' > "$chunk_file"
+                    
+                    # Compress chunk
+                    gzip -9 -c "$chunk_file" > "$chunk_gz"
+                    rm -f "$chunk_file"
+                    
+                    # Update metadata with chunk info
+                    local chunk_size=$(stat -f%z "$chunk_gz" 2>/dev/null || stat -c%s "$chunk_gz")
+                    jq --arg part "${chunk_number}" \
+                       --arg size "$((chunk_size / 1024))KB" \
+                    '.chunks += [{
+                        part: $part,
+                        compressed_size: $size
+                    }]' "${results_dir}/certs.json" > "${results_dir}/certs.json.tmp"
+                    mv "${results_dir}/certs.json.tmp" "${results_dir}/certs.json"
+                done
+            else
+                echo "Compressing as single file..."
+                gzip -9 -c "$input_file" > "${results_dir}/certs.json.gz"
+                jq '{
+                    total_count: .total_count,
+                    scan_time: .scan_time,
+                    split: false,
+                    compressed_size: "'$(($(stat -f%z "${results_dir}/certs.json.gz" 2>/dev/null || stat -c%s "${results_dir}/certs.json.gz") / 1024))'KB"
+                }' "$input_file" > "${results_dir}/certs.json"
+            fi
+          }
+
+          # Read ranges to scan
+          readarray -t ranges < <(jq -r '.[]' ranges_to_scan.json)
+          
+          # Process ranges one at a time to avoid git conflicts
+          for cidr in "${ranges[@]}"; do
+            echo "Processing range: $cidr"
+            safe_name=$(echo "$cidr" | tr '/' '_')
+            results_dir="cert_results/${safe_name}"
+            mkdir -p "$results_dir"
+            
+            # Check if ZMap results exist
+            zmap_result="zmap_results/${safe_name}.json"
+            if [ ! -f "$zmap_result" ]; then
+              echo "No ZMap results found for $cidr, skipping..."
+              continue
+            fi
+            
+            # Extract IPs from ZMap results
+            jq -r '.ips[]?' "$zmap_result" > "tmp_ips.txt" 2>/dev/null
+            
+            if [ -s tmp_ips.txt ]; then
+              echo "Running ZGrab2 for ${safe_name}..."
+              
+              if timeout 180m docker run --rm --network=host -v "${{ github.workspace }}":/data \
+                sec32/zgrab2 zgrab2 tls --port 443 \
+                --timeout 10s \
+                --input-file=/data/tmp_ips.txt \
+                --output-file=/data/tmp_certs.json; then
+                
+                process_zgrab_output "tmp_certs.json" "$results_dir"
+                
+                if [ -f "${results_dir}/certs.json" ]; then
+                  total_certs=$(jq '.total_count' "${results_dir}/certs.json")
+                  is_split=$(jq -r '.split // false' "${results_dir}/certs.json")
+                  
+                  # Create summary file
+                  if [ "$is_split" = "true" ]; then
+                    num_chunks=$(jq '.chunks | length' "${results_dir}/certs.json")
+                    echo "{
+                      \"range\": \"$cidr\",
+                      \"total_certificates\": $total_certs,
+                      \"split\": true,
+                      \"total_chunks\": $num_chunks,
+                      \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"
+                    }" > "${results_dir}/summary.json"
+                    echo "Processed $total_certs certificates in $num_chunks chunks for $cidr"
+                  else
+                    echo "{
+                      \"range\": \"$cidr\",
+                      \"total_certificates\": $total_certs,
+                      \"split\": false,
+                      \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"
+                    }" > "${results_dir}/summary.json"
+                    echo "Processed $total_certs certificates for $cidr"
+                  fi
+                  
+                  # Push results for this range
+                  push_changes "$cidr" "$results_dir" || echo "Failed to push changes for $cidr"
+                else
+                  echo "Failed to create output file for $cidr"
+                fi
+              else
+                echo "ZGrab2 scan failed for range: $cidr"
+              fi
+            else
+              echo "No IPs found in ZMap results for range: $cidr"
+            fi
+            
+            # Cleanup temporary files
+            rm -f tmp_ips.txt tmp_certs.json
+          done
+
+      - name: Cleanup running scans file
+        if: always()
+        run: |
+          echo "Starting cleanup of running cert scans file..."
+          
+          # Reset git state first
+          git fetch origin main
+          git checkout main -f
+          git reset --hard origin/main
+          git clean -fd
+          
+          # Setup git identity
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          # Define running scans file path
+          RUNNING_SCANS_FILE=".github/running_cert_scans/workflow_${{ github.run_id }}.txt"
+          
+          echo "Checking for running scans file: $RUNNING_SCANS_FILE"
+          
+          # Check if file exists
+          if [ -f "$RUNNING_SCANS_FILE" ]; then
+            echo "Found running scans file. Removing it..."
+            
+            # Remove the file
+            rm -f "$RUNNING_SCANS_FILE"
+            
+            # Stage the deletion
+            git add --all .github/running_cert_scans/
+            
+            # Commit the deletion
+            if git commit -m "Remove running cert scans file for workflow ${{ github.run_id }}"; then
+              echo "Changes committed. Pushing to repository..."
+              
+              # Push with retry logic
+              max_retries=3
+              for retry in $(seq 1 $max_retries); do
+                if git push origin main; then
+                  echo "Successfully removed running cert scans file"
+                  break
+                else
+                  if [ $retry -eq $max_retries ]; then
+                    echo "Failed to push changes after $max_retries attempts"
+                  else
+                    echo "Push failed, retrying ($retry/$max_retries)..."
+                    git pull --rebase origin main
+                    sleep 3
+                  fi
+                fi
+              done
+            else
+              echo "No changes to commit or commit failed"
+            fi
+          else
+            echo "Running cert scans file not found for this workflow"
+          fi
+
+      - name: Trigger next batch if more ranges available
+        if: steps.range_finder.outputs.ranges_found == inputs.batch_size
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get current workflow filename
+          WORKFLOW_PATH=".github/workflows/zgrab-cert-workflow.yml"
+          
+          # Check if workflow file exists
+          if [ ! -f "$WORKFLOW_PATH" ]; then
+            # Try to find the workflow file
+            WORKFLOW_PATH=$(find .github/workflows -name "*.yml" -type f -exec grep -l "ZGrab2 Certificate Collection" {} \; | head -n 1)
+            
+            if [ -z "$WORKFLOW_PATH" ]; then
+              echo "Could not find workflow file. Please check the workflow name."
+              exit 1
+            fi
+          fi
+          
+          echo "Found workflow file: $WORKFLOW_PATH"
+          WORKFLOW_NAME=$(basename "$WORKFLOW_PATH")
+          
+          # Trigger next workflow run
+          echo "Triggering next batch with workflow: $WORKFLOW_NAME"
+          curl -L \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$WORKFLOW_NAME/dispatches" \
+            -d "{\"ref\":\"main\",\"inputs\":{\"batch_size\":\"${{ inputs.batch_size }}\"}}"
