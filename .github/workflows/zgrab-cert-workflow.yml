@@ -46,37 +46,43 @@ jobs:
       - name: Find next available ranges
         id: range_finder
         run: |
+          # Create arrays to store processed and running ranges
+          processed_ranges=()
+          running_ranges=()
+          valid_ranges=()
+          ranges_to_process=()
+
           # Create empty ranges file
           echo "[]" > ranges_to_scan.json
           
           # Get list of scanned certificate ranges
-          processed_ranges=()
+          echo "Checking for already processed ranges..."
           find cert_results -type f -name "summary.json" | while read -r summary_file; do
             range=$(jq -r '.range' "$summary_file")
             if [ -n "$range" ]; then
               processed_ranges+=("$range")
+              echo "Already processed: $range"
             fi
           done
           
           # Get list of currently running scans
-          running_ranges=()
+          echo "Checking for currently running scans..."
           for f in .github/running_cert_scans/*; do
-            if [ -f "$f" ]; then
-              readarray -t current_running < <(cat "$f")
-              running_ranges+=("${current_running[@]}")
+            if [ -f "$f" ] && [ "$(basename "$f")" != "workflow_${{ github.run_id }}.txt" ]; then
+              while IFS= read -r line; do
+                if [ -n "$line" ]; then
+                  running_ranges+=("$line")
+                  echo "Currently running: $line"
+                fi
+              done < "$f"
             fi
           done
           
           # Create running scans file for this workflow
           echo "" > ".github/running_cert_scans/workflow_${{ github.run_id }}.txt"
           
-          # Counter for ranges found
-          ranges_found=0
-          
-          # First, find ZMap results that have valid IPs
+          # Find ZMap results that have valid IPs
           echo "Looking for ZMap results with active IPs..."
-          valid_ranges=()
-          
           find zmap_results -name "*.json" | while read -r zmap_file; do
             # Skip summary.json
             if [[ $(basename "$zmap_file") == "summary.json" ]]; then
@@ -88,30 +94,27 @@ jobs:
             cidr=$(echo "$filename" | tr '_' '/')
             
             # Check if it has active IPs
-            total_ips=$(jq '.total_ips' "$zmap_file")
-            if [ "$total_ips" -gt 0 ]; then
-              valid_ranges+=("$cidr")
-              echo "Found range with active IPs: $cidr (${total_ips} IPs)"
+            if [ -f "$zmap_file" ]; then
+              total_ips=$(jq '.total_ips' "$zmap_file" 2>/dev/null || echo "0")
+              if [ "$total_ips" -gt 0 ]; then
+                valid_ranges+=("$cidr")
+                
+                # Check if already processed or running
+                if printf '%s\n' "${processed_ranges[@]}" | grep -q -P "^${cidr}$"; then
+                  echo "Skipping $cidr (already processed)"
+                elif printf '%s\n' "${running_ranges[@]}" | grep -q -P "^${cidr}$"; then
+                  echo "Skipping $cidr (currently running in another workflow)"
+                else
+                  ranges_to_process+=("$cidr")
+                  echo "Found range to process: $cidr (${total_ips} IPs)"
+                fi
+              fi
             fi
           done
           
-          echo "Found ${#valid_ranges[@]} ranges with active IPs"
-          
-          # Process each range from the ones with active IPs
-          for cidr in "${valid_ranges[@]}"; do
-            # Skip if already processed
-            if [[ " ${processed_ranges[@]} " =~ " ${cidr} " ]]; then
-              echo "Range $cidr already processed, skipping..."
-              continue
-            fi
-            
-            # Skip if currently being processed
-            if [[ " ${running_ranges[@]} " =~ " ${cidr} " ]]; then
-              echo "Range $cidr is currently being processed, skipping..."
-              continue
-            fi
-            
-            # Add to our batch if we haven't reached the limit
+          # Select ranges for this batch
+          ranges_found=0
+          for cidr in "${ranges_to_process[@]}"; do
             if [ $ranges_found -lt ${{ inputs.batch_size }} ]; then
               echo "$cidr" >> ".github/running_cert_scans/workflow_${{ github.run_id }}.txt"
               jq --arg cidr "$cidr" '. += [$cidr]' ranges_to_scan.json > ranges_to_scan.json.tmp
@@ -122,6 +125,14 @@ jobs:
               break
             fi
           done
+          
+          # Print summary
+          echo "====== SUMMARY ======="
+          echo "Found ${#valid_ranges[@]} total ranges with active IPs"
+          echo "Already processed: ${#processed_ranges[@]} ranges"
+          echo "Currently running: ${#running_ranges[@]} ranges"
+          echo "Available to process: ${#ranges_to_process[@]} ranges"
+          echo "Selected for this batch: $ranges_found ranges"
           
           # Set output
           echo "ranges_file=ranges_to_scan.json" >> $GITHUB_OUTPUT
@@ -191,75 +202,6 @@ jobs:
             
             echo "Failed to push changes after $max_attempts attempts"
             return 1
-          }
-
-          # Process ZGrab output function
-          process_zgrab_output() {
-            local input_file="$1"
-            local results_dir="$2"
-            
-            if [ ! -s "$input_file" ]; then
-              echo "Empty or missing input file: $input_file"
-              echo '{
-                "certificates": [],
-                "total_count": 0,
-                "scan_time": "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
-              }' > "${results_dir}/certs.json"
-              return
-            fi
-            
-            echo "Processing certificates..."
-            local temp_json="${results_dir}/temp_certs.json"
-            
-            # Process and create initial JSON
-            jq -c '[inputs | select(.data != null and .data.tls != null) |
-              select(.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] != null) |
-              select(.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] != "") | {
-                ip: .ip,
-                tls: {
-                  protocol_version: (.data.tls.result.handshake_log.server_hello.version.name // null),
-                  cipher_suite: {
-                    name: (.data.tls.result.handshake_log.server_hello.cipher_suite.name // null),
-                    value: (.data.tls.result.handshake_log.server_hello.cipher_suite.value // null)
-                  },
-                  certificate_details: {
-                    validity: {
-                      start: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.validity.start // null),
-                      end: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.validity.end // null)
-                    },
-                    issuer: {
-                      common_name: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.common_name[0] // null),
-                      organization: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.organization[0] // null),
-                      country: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.country[0] // null)
-                    },
-                    subject: {
-                      common_name: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] // null)
-                    },
-                    public_key: {
-                      algorithm: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject_key_info.key_algorithm.name // null),
-                      length: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject_key_info.rsa_public_key.length // null)
-                    }
-                  },
-                  security_audit: {
-                    certificate_chain: [
-                      .data.tls.result.handshake_log.server_certificates.chain[]? | 
-                      select(. != null) | {
-                        issuer_common_name: (.parsed.issuer.common_name[0] // null),
-                        valid: (.parsed.signature.valid // false)
-                      }
-                    ],
-                    browser_trusted: (.data.tls.result.handshake_log.server_certificates.validation.browser_trusted // false)
-                  }
-                }
-              }] | {
-                certificates: .,
-                total_count: length,
-                scan_time: "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
-              }' "$input_file" > "$temp_json"
-
-            # Compress results
-            split_and_compress_results "$temp_json" "$results_dir"
-            rm -f "$temp_json"
           }
           
           # Split and compress results function
@@ -331,8 +273,80 @@ jobs:
             fi
           }
 
+          # Process ZGrab output function
+          process_zgrab_output() {
+            local input_file="$1"
+            local results_dir="$2"
+            
+            if [ ! -s "$input_file" ]; then
+              echo "Empty or missing input file: $input_file"
+              echo '{
+                "certificates": [],
+                "total_count": 0,
+                "scan_time": "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
+              }' > "${results_dir}/certs.json"
+              return
+            fi
+            
+            echo "Processing certificates..."
+            local temp_json="${results_dir}/temp_certs.json"
+            
+            # Process and create initial JSON
+            jq -c '[inputs | select(.data != null and .data.tls != null) |
+              select(.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] != null) |
+              select(.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] != "") | {
+                ip: .ip,
+                tls: {
+                  protocol_version: (.data.tls.result.handshake_log.server_hello.version.name // null),
+                  cipher_suite: {
+                    name: (.data.tls.result.handshake_log.server_hello.cipher_suite.name // null),
+                    value: (.data.tls.result.handshake_log.server_hello.cipher_suite.value // null)
+                  },
+                  certificate_details: {
+                    validity: {
+                      start: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.validity.start // null),
+                      end: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.validity.end // null)
+                    },
+                    issuer: {
+                      common_name: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.common_name[0] // null),
+                      organization: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.organization[0] // null),
+                      country: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.country[0] // null)
+                    },
+                    subject: {
+                      common_name: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] // null)
+                    },
+                    public_key: {
+                      algorithm: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject_key_info.key_algorithm.name // null),
+                      length: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject_key_info.rsa_public_key.length // null)
+                    }
+                  },
+                  security_audit: {
+                    certificate_chain: [
+                      .data.tls.result.handshake_log.server_certificates.chain[]? | 
+                      select(. != null) | {
+                        issuer_common_name: (.parsed.issuer.common_name[0] // null),
+                        valid: (.parsed.signature.valid // false)
+                      }
+                    ],
+                    browser_trusted: (.data.tls.result.handshake_log.server_certificates.validation.browser_trusted // false)
+                  }
+                }
+              }] | {
+                certificates: .,
+                total_count: length,
+                scan_time: "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
+              }' "$input_file" > "$temp_json"
+
+            # Compress results
+            split_and_compress_results "$temp_json" "$results_dir"
+            rm -f "$temp_json"
+          }
+
           # Read ranges to scan
+          echo "Reading ranges from ranges_to_scan.json"
           readarray -t ranges < <(jq -r '.[]' ranges_to_scan.json)
+          total_ranges=${#ranges[@]}
+          echo "Found $total_ranges ranges to process"
           
           # Process ranges one at a time to avoid git conflicts
           for cidr in "${ranges[@]}"; do
@@ -352,6 +366,9 @@ jobs:
             jq -r '.ips[]?' "$zmap_result" > "tmp_ips.txt" 2>/dev/null
             
             if [ -s tmp_ips.txt ]; then
+              ip_count=$(wc -l < tmp_ips.txt)
+              echo "Found $ip_count IPs to scan for $cidr"
+              
               echo "Running ZGrab2 for ${safe_name}..."
               
               if timeout 180m docker run --rm --network=host -v "${{ github.workspace }}":/data \
@@ -461,33 +478,66 @@ jobs:
           fi
 
       - name: Trigger next batch if more ranges available
-        if: steps.range_finder.outputs.ranges_found == inputs.batch_size
+        if: steps.range_finder.outputs.ranges_found > 0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Get current workflow filename
-          WORKFLOW_PATH=".github/workflows/zgrab-cert-workflow.yml"
+          # Count total ranges with ZMap results that have IPs
+          total_ranges_with_ips=0
+          processed_ranges=0
           
-          # Check if workflow file exists
-          if [ ! -f "$WORKFLOW_PATH" ]; then
-            # Try to find the workflow file
-            WORKFLOW_PATH=$(find .github/workflows -name "*.yml" -type f -exec grep -l "ZGrab2 Certificate Collection" {} \; | head -n 1)
-            
-            if [ -z "$WORKFLOW_PATH" ]; then
-              echo "Could not find workflow file. Please check the workflow name."
-              exit 1
+          # Count ranges with IPs
+          find zmap_results -name "*.json" | while read -r zmap_file; do
+            if [[ $(basename "$zmap_file") != "summary.json" ]]; then
+              if [ -f "$zmap_file" ]; then
+                total_ips=$(jq '.total_ips' "$zmap_file" 2>/dev/null || echo "0")
+                if [ "$total_ips" -gt 0 ]; then
+                  total_ranges_with_ips=$((total_ranges_with_ips + 1))
+                fi
+              fi
             fi
+          done
+          
+          # Count processed ranges
+          find cert_results -type f -name "summary.json" | while read -r summary_file; do
+            processed_ranges=$((processed_ranges + 1))
+          done
+          
+          # If there are more ranges to process, trigger next batch
+          remaining=$((total_ranges_with_ips - processed_ranges))
+          echo "Total ranges with IPs: $total_ranges_with_ips"
+          echo "Processed ranges: $processed_ranges"
+          echo "Remaining ranges: $remaining"
+          
+          if [ $remaining -gt 0 ]; then
+            echo "There are still $remaining ranges to process. Triggering next batch..."
+            
+            # Get current workflow filename
+            WORKFLOW_PATH=".github/workflows/zgrab-cert-workflow.yml"
+            
+            # Check if workflow file exists
+            if [ ! -f "$WORKFLOW_PATH" ]; then
+              # Try to find the workflow file
+              WORKFLOW_PATH=$(find .github/workflows -name "*.yml" -type f -exec grep -l "ZGrab2 Certificate Collection" {} \; | head -n 1)
+              
+              if [ -z "$WORKFLOW_PATH" ]; then
+                echo "Could not find workflow file. Please check the workflow name."
+                exit 1
+              fi
+            fi
+            
+            echo "Found workflow file: $WORKFLOW_PATH"
+            WORKFLOW_NAME=$(basename "$WORKFLOW_PATH")
+            
+            # Trigger next workflow run
+            echo "Triggering next batch with workflow: $WORKFLOW_NAME"
+            curl -L \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$WORKFLOW_NAME/dispatches" \
+              -d "{\"ref\":\"main\",\"inputs\":{\"batch_size\":\"${{ inputs.batch_size }}\"}}"
+          else
+            echo "All ranges have been processed. No need to trigger next batch."
           fi
-          
-          echo "Found workflow file: $WORKFLOW_PATH"
-          WORKFLOW_NAME=$(basename "$WORKFLOW_PATH")
-          
-          # Trigger next workflow run
-          echo "Triggering next batch with workflow: $WORKFLOW_NAME"
-          curl -L \
-            -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$WORKFLOW_NAME/dispatches" \
-            -d "{\"ref\":\"main\",\"inputs\":{\"batch_size\":\"${{ inputs.batch_size }}\"}}"
